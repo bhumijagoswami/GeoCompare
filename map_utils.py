@@ -42,16 +42,17 @@ def _add_legend(m: folium.Map, layer_type: str):
     if layer_type != "LULC Classification":
         return
     items = "".join(
-        f'<div style="display:flex;align-items:center;margin-bottom:2px;">'
+        f'<div style="display:flex;align-items:center;margin-bottom:2px;color:#1a1a1a;">'
         f'<span style="background:{color};width:12px;height:12px;display:inline-block;'
         f'margin-right:6px;border:1px solid #333;"></span>{name}</div>'
         for name, color in LULC_LEGEND.items()
     )
     legend_html = f"""
     <div style="position: fixed; bottom: 30px; left: 30px; z-index: 9999;
-                background: white; padding: 10px 12px; border-radius: 6px;
-                box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 12px;">
-        <b>LULC Classes</b><br>{items}
+                background: #ffffff; color: #1a1a1a; padding: 10px 12px; border-radius: 6px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 12px;
+                font-family: -apple-system, Arial, sans-serif;">
+        <b style="color:#1a1a1a;">LULC Classes</b><br>{items}
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
