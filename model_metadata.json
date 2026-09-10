@@ -1,0 +1,23 @@
+{
+  "model_file": "model.pkl",
+  "model_type": "RandomForestClassifier",
+  "sklearn_version": "FILL_IN_WHEN_TRAINED",
+  "trained_on": "FILL_IN_DATE",
+  "training_script": "train_model.py",
+  "training_data_source": "FILL_IN: path or description of training_data.csv provenance",
+  "feature_columns": ["B2", "B3", "B4", "B8", "B11", "NDVI", "NDWI", "NDBI"],
+  "class_mapping": {
+    "0": "Vegetation",
+    "1": "Built-up",
+    "2": "Water",
+    "3": "Bare Land"
+  },
+  "class_distribution_in_training_set": {
+    "Vegetation": "FILL_IN_COUNT_OR_PERCENT",
+    "Built-up": "FILL_IN_COUNT_OR_PERCENT",
+    "Water": "FILL_IN_COUNT_OR_PERCENT",
+    "Bare Land": "FILL_IN_COUNT_OR_PERCENT"
+  },
+  "validation_accuracy": "FILL_IN_IF_AVAILABLE",
+  "notes": "Update this file every time model.pkl is retrained so predictions stay traceable to a training run."
+}
