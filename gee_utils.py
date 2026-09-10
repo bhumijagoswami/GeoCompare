@@ -5,17 +5,18 @@ from google.oauth2 import service_account
 PROJECT_ID = "earth-engine-demo-501808"
 
 def init_gee():
-    try:
-        ee.Initialize(project=PROJECT_ID)
-    except Exception:
-        # Tries local auth first, falls back to Streamlit Secrets for cloud deployment
+    # 1. Cloud Deployment: Check for Streamlit Secrets FIRST
+    if "gcp_service_account" in st.secrets:
+        key_dict = dict(st.secrets["gcp_service_account"])
+        creds = service_account.Credentials.from_service_account_info(key_dict)
+        ee.Initialize(creds, project=PROJECT_ID)
+    else:
+        # 2. Local Deployment: Use default auth fallback
         try:
-            ee.Authenticate()
             ee.Initialize(project=PROJECT_ID)
         except Exception:
-            key_dict = dict(st.secrets["gcp_service_account"])
-            creds = service_account.Credentials.from_service_account_info(key_dict)
-            ee.Initialize(creds, project=PROJECT_ID)
+            ee.Authenticate()
+            ee.Initialize(project=PROJECT_ID)
 
 def get_base_image(lat, lon, max_radius):
     init_gee()
