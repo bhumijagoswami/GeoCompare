@@ -91,7 +91,9 @@ with tab_compare:
     with st.expander("Advanced: date range & cloud filter"):
         start_date, end_date, cloud_filter = date_range_controls("compare")
 
-    if st.button("Run Multi-Ring Analysis", type="primary"):
+    run_clicked = st.button("Run Multi-Ring Analysis", type="primary")
+
+    if run_clicked:
         try:
             with st.spinner("Fetching imagery for Location A..."):
                 img1 = get_base_image(lat1, lon1, max_radius, start_date, end_date, cloud_filter)
@@ -102,25 +104,50 @@ with tab_compare:
                 pct1, conf1, counts1 = analyze_rings(img1, lat1, lon1, radii)
                 pct2, conf2, counts2 = analyze_rings(img2, lat2, lon2, radii)
 
+            # Stash everything needed to render results in session_state.
+            # This is required because st_folium is an interactive component:
+            # loading/clicking it triggers a Streamlit rerun, and on that rerun
+            # `st.button(...)` resets to False. Without session_state, the
+            # results computed above would vanish immediately after the map
+            # renders once. Storing them here lets the render step below run
+            # on every rerun, not just the one where the button was clicked.
+            st.session_state["compare_result"] = {
+                "lat1": lat1, "lon1": lon1, "lat2": lat2, "lon2": lon2,
+                "layer": layer, "radii": radii,
+                "img1": img1, "img2": img2,
+                "pct1": pct1, "conf1": conf1, "counts1": counts1,
+                "pct2": pct2, "conf2": conf2, "counts2": counts2,
+            }
         except GEEDataError as e:
             st.error(f"Earth Engine data issue: {e}")
-            st.stop()
+            st.session_state.pop("compare_result", None)
         except ModelNotFoundError as e:
             st.error(f"Model issue: {e}")
-            st.stop()
+            st.session_state.pop("compare_result", None)
         except Exception as e:
             st.error(f"Unexpected error during analysis: {e}")
-            st.stop()
+            st.session_state.pop("compare_result", None)
+
+    # Render from session_state (not just right after the button click) so
+    # results persist across the rerun that st_folium triggers.
+    result = st.session_state.get("compare_result")
+    if result:
+        lat1, lon1 = result["lat1"], result["lon1"]
+        lat2, lon2 = result["lat2"], result["lon2"]
+        layer, radii = result["layer"], result["radii"]
+        img1, img2 = result["img1"], result["img2"]
+        pct1, conf1, counts1 = result["pct1"], result["conf1"], result["counts1"]
+        pct2, conf2, counts2 = result["pct2"], result["conf2"], result["counts2"]
 
         st.write("---")
         st.subheader("🗺️ Map View")
         map_col1, map_col2 = st.columns(2)
         with map_col1:
             mapA = get_map(lat1, lon1, img1, "Location A", layer, radii)
-            st_folium(mapA, width=500, height=400, key="mapA")
+            st_folium(mapA, width=500, height=400, key="mapA", returned_objects=[])
         with map_col2:
             mapB = get_map(lat2, lon2, img2, "Location B", layer, radii)
-            st_folium(mapB, width=500, height=400, key="mapB")
+            st_folium(mapB, width=500, height=400, key="mapB", returned_objects=[])
 
         st.write("---")
         st.subheader("📈 LULC Gradient (Center ➔ Outskirts, true annuli)")
