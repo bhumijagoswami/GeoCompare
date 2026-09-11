@@ -30,7 +30,10 @@ ee.Authenticate()  # opens an interactive auth flow in Colab
 ee.Initialize(project=PROJECT_ID)
 
 # --- CELL 3: Config — feature bands, classes, and sample regions ---
-FEATURE_COLS = ['B2', 'B3', 'B4', 'B8', 'B11', 'NDVI', 'NDWI', 'NDBI']
+# v2: added B12 (SWIR2), BSI (Bare Soil Index), and TEXTURE (local std dev)
+# specifically to reduce the Built-up <-> Bare Land confusion seen in v1
+# (60% and 62.5% recall respectively — the model's two weakest classes).
+FEATURE_COLS = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'NDWI', 'NDBI', 'BSI', 'TEXTURE']
 CLASS_NAMES = {0: "Vegetation", 1: "Built-up", 2: "Water", 3: "Bare Land"}
 
 # WorldCover codes -> GeoCompare class ids (must match map_utils.py's remap
@@ -72,11 +75,32 @@ def get_feature_image(lat, lon, radius_m):
     if dataset.size().getInfo() == 0:
         return None, None
     image = dataset.median().clip(poi)
+
     ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
     ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI')
     ndbi = image.normalizedDifference(['B11', 'B8']).rename('NDBI')
-    bands = image.select(['B2', 'B3', 'B4', 'B8', 'B11'])
-    feature_img = bands.addBands([ndvi, ndwi, ndbi])
+
+    # Bare Soil Index — targets the Built-up/Bare-Land confusion directly.
+    bsi = image.expression(
+        '((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))',
+        {
+            'SWIR1': image.select('B11'),
+            'RED': image.select('B4'),
+            'NIR': image.select('B8'),
+            'BLUE': image.select('B2'),
+        }
+    ).rename('BSI')
+
+    # Local texture (std dev in a 3x3 window) — built-up areas are spatially
+    # "busy" (buildings, roads, gaps), bare land is smooth/uniform. Same
+    # feature computed identically in gee_utils.py so train/inference match.
+    texture = image.select('B8').reduceNeighborhood(
+        reducer=ee.Reducer.stdDev(),
+        kernel=ee.Kernel.square(radius=1),
+    ).rename('TEXTURE')
+
+    bands = image.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+    feature_img = bands.addBands([ndvi, ndwi, ndbi, bsi, texture])
 
     worldcover = ee.Image('ESA/WorldCover/v200/2021').select('Map').clip(poi)
     label_img = worldcover.remap(WORLDCOVER_SRC, WORLDCOVER_DST, defaultValue=255).rename('label')
@@ -181,7 +205,12 @@ metadata = {
     "confusion_matrix": cm.tolist(),
     "n_train_samples": len(X_train),
     "n_test_samples": len(X_test),
-    "notes": "Trained in Colab via train_model_colab.py using WorldCover-derived labels for traceability."
+    "notes": (
+        "Trained in Colab via train_model_colab.py using WorldCover-derived labels for traceability. "
+        "v2: added B12, BSI, and TEXTURE features specifically to reduce the Built-up/Bare-Land "
+        "confusion observed in v1 (v1 accuracy: 73.85%, with Built-up recall 60% and Bare Land "
+        "recall 62.5% — the two weakest classes, frequently confused with each other)."
+    )
 }
 
 with open("model_metadata.json", "w") as f:

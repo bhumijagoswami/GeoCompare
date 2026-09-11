@@ -53,11 +53,34 @@ def init_gee():
 
 def _build_feature_image(dataset: ee.ImageCollection, poi: ee.Geometry) -> ee.Image:
     image = dataset.median().clip(poi)
+
     ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
     ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI')
     ndbi = image.normalizedDifference(['B11', 'B8']).rename('NDBI')
-    bands = image.select(['B2', 'B3', 'B4', 'B8', 'B11'])
-    return bands.addBands([ndvi, ndwi, ndbi])
+
+    # Bare Soil Index: helps separate dry bare soil from built-up surfaces,
+    # which are the two classes our classifier confuses most often.
+    bsi = image.expression(
+        '((SWIR1 + RED) - (NIR + BLUE)) / ((SWIR1 + RED) + (NIR + BLUE))',
+        {
+            'SWIR1': image.select('B11'),
+            'RED': image.select('B4'),
+            'NIR': image.select('B8'),
+            'BLUE': image.select('B2'),
+        }
+    ).rename('BSI')
+
+    # Local texture: built-up areas have "busy" irregular patterns (buildings,
+    # roads, gaps), while bare land is spatially smooth and uniform. A local
+    # standard deviation over a small neighborhood captures that difference,
+    # which pure per-pixel spectral values cannot.
+    texture = image.select('B8').reduceNeighborhood(
+        reducer=ee.Reducer.stdDev(),
+        kernel=ee.Kernel.square(radius=1),
+    ).rename('TEXTURE')
+
+    bands = image.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+    return bands.addBands([ndvi, ndwi, ndbi, bsi, texture])
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
