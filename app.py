@@ -23,7 +23,7 @@ from gee_utils import (
     get_base_image_for_year, GEEDataError, NO2_MIN_YEAR
 )
 from analysis import analyze_location_over_time, ModelNotFoundError, CLASS_NAMES, get_ring_bounds
-from map_utils import get_map
+from map_utils import get_map, LULC_LEGEND
 from streamlit_folium import st_folium
 
 st.set_page_config(layout="wide", page_title="GeoCompare")
@@ -160,7 +160,8 @@ if state:
         with lulc_cols[idx]:
             st.write(f"**Ring {label}**")
             ring_df = long_df[long_df["Ring"] == label].set_index("Year")[list(CLASS_NAMES.values())]
-            st.line_chart(ring_df)
+            chart_colors = [LULC_LEGEND[cls] for cls in ring_df.columns]
+            st.line_chart(ring_df, color=chart_colors)
 
     st.write("---")
     st.subheader("NO2 (Air Quality) Change Over Time, Per Ring")
