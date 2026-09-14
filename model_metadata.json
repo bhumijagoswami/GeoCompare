@@ -1,0 +1,77 @@
+{
+  "model_file": "model.pkl",
+  "model_type": "XGBClassifier",
+  "sklearn_version": "1.6.1",
+  "xgboost_version": "3.4.1",
+  "trained_on": "2026-09-14",
+  "training_script": "train_model_colab.py",
+  "training_data_source": "ESA WorldCover v200 2021 used as ground-truth labels, remapped to 4 classes; Sentinel-2 SR Harmonized (2023 median composite) used for feature bands. Sampled across 16 regions: Delhi_NCR_urban, Jaipur_urban_arid, Punjab_cropland, Thar_desert_bare, Chilika_lake_water, Western_Ghats_veg, Mumbai_dense_urban, Ganga_floodplain_mixed, Bangalore_urban, Chennai_coastal_urban, Sundarbans_water_mangrove, Rann_of_Kutch_bare_salt, Himalayan_foothill_veg, Godavari_delta_cropland, Rajasthan_bare_arid, Kerala_backwaters_water.",
+  "feature_columns": [
+    "B2",
+    "B3",
+    "B4",
+    "B8",
+    "B11",
+    "B12",
+    "NDVI",
+    "NDWI",
+    "NDBI",
+    "BSI",
+    "TEXTURE",
+    "NDVI_STD",
+    "SAR_VV",
+    "SAR_VH",
+    "NIGHT_LIGHTS"
+  ],
+  "class_mapping": {
+    "0": "Vegetation",
+    "1": "Built-up",
+    "2": "Water",
+    "3": "Bare Land"
+  },
+  "class_distribution_in_training_set": {
+    "Water": "26.0%",
+    "Vegetation": "25.2%",
+    "Bare Land": "24.6%",
+    "Built-up": "24.2%"
+  },
+  "validation_accuracy": 0.8327,
+  "cross_validation_accuracy": 0.8355,
+  "best_hyperparameters": {
+    "colsample_bytree": 1.0,
+    "gamma": 0,
+    "learning_rate": 0.05,
+    "max_depth": 8,
+    "n_estimators": 500,
+    "subsample": 0.8
+  },
+  "confusion_matrix": [
+    [
+      1139,
+      123,
+      25,
+      69
+    ],
+    [
+      99,
+      1048,
+      1,
+      152
+    ],
+    [
+      22,
+      4,
+      1311,
+      63
+    ],
+    [
+      71,
+      205,
+      66,
+      981
+    ]
+  ],
+  "n_train_samples": 21514,
+  "n_test_samples": 5379,
+  "notes": "Trained in Colab via train_model_colab.py using WorldCover-derived labels for traceability. v1 (RF, 8 features, 8 regions): 73.85% accuracy. v2 (RF, +B12/BSI/TEXTURE, 8 regions): 76.88%. v3 (RF, 16 regions, GridSearchCV tuning, class_weight='balanced'): 77.92%. v4: XGBClassifier baseline. v5 (this version): Added NDVI_STD, SAR_VV, SAR_VH, and NIGHT_LIGHTS to resolve Built-up/Bare Land confusion."
+}
