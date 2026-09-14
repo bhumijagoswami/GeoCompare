@@ -115,7 +115,7 @@ def get_base_image_id(lat, lon, max_radius, start_date, end_date, cloud_filter=C
 def get_base_image(lat, lon, max_radius, start_date="2023-01-01", end_date="2023-12-31",
                     cloud_filter=CLOUD_FILTER_DEFAULT) -> ee.Image:
     """
-    Builds the Sentinel-2 feature composite (RGB + NIR/SWIR + NDVI/NDWI/NDBI)
+    Builds the Sentinel-2 feature composite (RGB + NIR/SWIR + NDVI/NDWI/NDBI/BSI/TEXTURE)
     clipped to a buffer of max_radius around (lat, lon).
 
     Raises GEEDataError if no imagery is available for the given filters.
@@ -132,3 +132,82 @@ def get_base_image(lat, lon, max_radius, start_date="2023-01-01", end_date="2023
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', cloud_filter))
     )
     return _build_feature_image(dataset, poi)
+
+
+def ring_geometry(lat, lon, r_inner, r_outer):
+    """
+    True annulus: outer buffer minus inner buffer. r_inner<=0 -> solid disk.
+    Lives here (not in analysis.py) so both LULC classification and NO2
+    fetching use the exact same ring shapes.
+    """
+    outer = ee.Geometry.Point([lon, lat]).buffer(r_outer)
+    if r_inner <= 0:
+        return outer
+    inner = ee.Geometry.Point([lon, lat]).buffer(r_inner)
+    return outer.difference(inner, ee.ErrorMargin(1))
+
+
+def get_base_image_for_year(lat, lon, max_radius, year, cloud_filter=CLOUD_FILTER_DEFAULT) -> ee.Image:
+    """Convenience wrapper: builds the Sentinel-2 feature composite for a full calendar year."""
+    start_date = f"{year}-01-01"
+    end_date = f"{year}-12-31"
+    return get_base_image(lat, lon, max_radius, start_date, end_date, cloud_filter)
+
+
+# --- NO2 (air quality) via Sentinel-5P TROPOMI ---------------------------
+# Sentinel-5P data only exists from mid-2018 onward. Earlier years will
+# raise GEEDataError below.
+NO2_COLLECTION = "COPERNICUS/S5P/OFFL/L3_NO2"
+NO2_BAND = "tropospheric_NO2_column_number_density"
+NO2_MIN_YEAR = 2019  # 2018 exists but only partial-year; 2019 is the first full year
+NO2_SCALE_METERS = 1113  # native-ish resolution for S5P L3 gridded products
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_no2_for_ring(lat, lon, r_inner, r_outer, year):
+    """
+    Returns the mean tropospheric NO2 column density (mol/m^2, converted to
+    µmol/m^2 for readability) over a ring for a given calendar year.
+
+    This is a raw physical measurement, not a model prediction — no ML
+    classifier is involved here, unlike the LULC side of the analysis.
+    """
+    if year < NO2_MIN_YEAR:
+        raise GEEDataError(
+            f"Sentinel-5P NO2 data isn't available before {NO2_MIN_YEAR} "
+            f"(requested {year}). Pick a later year for air quality analysis."
+        )
+    init_gee()
+    geom = ring_geometry(lat, lon, r_inner, r_outer)
+    start_date, end_date = f"{year}-01-01", f"{year}-12-31"
+
+    collection = (
+        ee.ImageCollection(NO2_COLLECTION)
+        .select(NO2_BAND)
+        .filterDate(start_date, end_date)
+        .filterBounds(geom)
+    )
+    size = collection.size().getInfo()
+    if size == 0:
+        raise GEEDataError(
+            f"No Sentinel-5P NO2 scenes found for this ring in {year}. "
+            f"Try a different year."
+        )
+
+    mean_image = collection.mean()
+    stats = mean_image.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=geom,
+        scale=NO2_SCALE_METERS,
+        maxPixels=1e9,
+        bestEffort=True,
+    ).getInfo()
+
+    raw_value = stats.get(NO2_BAND)
+    if raw_value is None:
+        raise GEEDataError(f"NO2 reduction returned no value for this ring in {year} (likely too small a ring).")
+
+    # Convert mol/m^2 -> µmol/m^2 (multiply by 1e6) purely for human-readable
+    # numbers; typical values then land roughly in the 10-100 range instead
+    # of ~0.00001-0.0001.
+    return raw_value * 1e6

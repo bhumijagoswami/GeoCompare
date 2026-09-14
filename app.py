@@ -1,272 +1,217 @@
 """
 app.py
-GeoCompare: Concentric LULC Gradient Analysis — Streamlit frontend.
+GeoCompare v3: Single-Location Concentric Ring + Multi-Year Change Analysis
 
-Changes vs. original:
-- Input validation on lat/lon (bounds enforced by number_input min/max).
-- Configurable date range + cloud-cover threshold (previously hardcoded to 2023).
-- True-annulus rings (via analysis.py) with clear "prev-next m" labeling.
-- Model confidence displayed alongside class percentages.
-- Robust error handling around GEE/model failures (no more silent zero-rows).
-- Legend on the map, st_folium instead of deprecated folium_static.
-- New "Batch / Time-Series" tab: upload a CSV of locations and/or compare the
-  same location across multiple years to see LULC change over time.
-- Map export (HTML) alongside the existing CSV export.
+Redesign vs. the earlier A-vs-B comparison app:
+- ONE location instead of two, with 3 concentric true-annulus rings.
+- Analysis runs across MULTIPLE YEARS (default 2019, 2022, 2026; any custom
+  years >= 2019 are allowed, since that's the first full year of Sentinel-5P
+  NO2 data used in this app).
+- Two change signals per ring per year: LULC composition (from our trained
+  Random Forest) and mean NO2 concentration (a raw Sentinel-5P measurement,
+  no ML model involved).
+- Results are stored in st.session_state so they survive the automatic
+  rerun that st_folium triggers on load/interaction (see the comment in the
+  run button's try block for why this matters).
 """
 
 import streamlit as st
 import pandas as pd
 from datetime import date
 
-from gee_utils import get_base_image, GEEDataError
-from analysis import analyze_rings, analyze_locations, ModelNotFoundError, CLASS_NAMES
+from gee_utils import (
+    get_base_image_for_year, GEEDataError, NO2_MIN_YEAR
+)
+from analysis import analyze_location_over_time, ModelNotFoundError, CLASS_NAMES, get_ring_bounds
 from map_utils import get_map
 from streamlit_folium import st_folium
 
 st.set_page_config(layout="wide", page_title="GeoCompare")
-st.title("🌍 GeoCompare: Concentric LULC Gradient Analysis")
+st.title("GeoCompare: Concentric Ring Change Analysis Over Time")
+st.caption(
+    "Pick one location, and see how land use and air quality have changed "
+    "over the years - broken down ring by ring, from the center outward."
+)
 
-tab_compare, tab_batch = st.tabs(["📍 Compare A vs B", "📦 Batch / Time-Series"])
-
-# ----------------------------------------------------------------------------
-# Shared sidebar-style controls (rendered inline per tab where needed)
-# ----------------------------------------------------------------------------
-
-def date_range_controls(key_prefix):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        start = st.date_input(f"Start date", value=date(2023, 1, 1),
-                               max_value=date.today(), key=f"{key_prefix}_start")
-    with c2:
-        end = st.date_input(f"End date", value=date(2023, 12, 31),
-                             max_value=date.today(), key=f"{key_prefix}_end")
-    with c3:
-        cloud = st.slider("Max cloud cover %", 0, 100, 10, key=f"{key_prefix}_cloud")
-    if start >= end:
-        st.error("Start date must be before end date.")
-        st.stop()
-    return start.isoformat(), end.isoformat(), cloud
-
-
-def render_ring_results(pct_results, conf_results, counts, title):
-    st.write(f"#### {title}")
-    df_pct = pd.DataFrame(pct_results).T
-    df_conf = pd.DataFrame(conf_results).T
-    zero_sample_rings = [k for k, v in counts.items() if v == 0]
-    if zero_sample_rings:
-        st.warning(f"No valid samples in ring(s): {', '.join(zero_sample_rings)}. "
-                   f"Shown as 0% — likely cloud gaps or a very thin ring.")
-    st.line_chart(df_pct)
-    with st.expander("Show class % and model confidence table"):
-        st.write("**Class composition (%)**")
-        st.dataframe(df_pct.style.format("{:.1f}"))
-        st.write("**Mean model confidence (%)**")
-        st.dataframe(df_conf.style.format("{:.1f}"))
-    return df_pct, df_conf
-
+CURRENT_YEAR = date.today().year
+DEFAULT_YEARS = [2019, 2022, min(2026, CURRENT_YEAR)]
+YEAR_OPTIONS = list(range(NO2_MIN_YEAR, CURRENT_YEAR + 1))
 
 # ----------------------------------------------------------------------------
-# TAB 1: Compare A vs B (core workflow, upgraded)
+# Inputs
 # ----------------------------------------------------------------------------
-with tab_compare:
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Location A")
-        lat1 = st.number_input("Lat A", value=28.4089, min_value=-90.0, max_value=90.0, format="%.6f")
-        lon1 = st.number_input("Lon A", value=77.3178, min_value=-180.0, max_value=180.0, format="%.6f")
-    with col2:
-        st.subheader("Location B")
-        lat2 = st.number_input("Lat B", value=26.8439, min_value=-90.0, max_value=90.0, format="%.6f")
-        lon2 = st.number_input("Lon B", value=75.5652, min_value=-180.0, max_value=180.0, format="%.6f")
+col1, col2 = st.columns(2)
+with col1:
+    lat = st.number_input("Latitude", value=28.6139, min_value=-90.0, max_value=90.0, format="%.6f")
+with col2:
+    lon = st.number_input("Longitude", value=77.2090, min_value=-180.0, max_value=180.0, format="%.6f")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        max_radius = st.slider("Max Outer Radius (meters)", 1000, 15000, 6000, step=500)
-        radii = [max_radius // 3, (max_radius * 2) // 3, max_radius]
-        st.info(f"**True annulus rings:** 0-{radii[0]}m, {radii[0]}-{radii[1]}m, {radii[1]}-{radii[2]}m")
-    with c2:
-        layer = st.selectbox("Map Mask Overlay",
-                              ["LULC Classification", "RGB", "NDVI (Vegetation)", "NDWI (Water)"])
-
-    with st.expander("Advanced: date range & cloud filter"):
-        start_date, end_date, cloud_filter = date_range_controls("compare")
-
-    run_clicked = st.button("Run Multi-Ring Analysis", type="primary")
-
-    if run_clicked:
-        try:
-            with st.spinner("Fetching imagery for Location A..."):
-                img1 = get_base_image(lat1, lon1, max_radius, start_date, end_date, cloud_filter)
-            with st.spinner("Fetching imagery for Location B..."):
-                img2 = get_base_image(lat2, lon2, max_radius, start_date, end_date, cloud_filter)
-
-            with st.spinner("Classifying rings..."):
-                pct1, conf1, counts1 = analyze_rings(img1, lat1, lon1, radii)
-                pct2, conf2, counts2 = analyze_rings(img2, lat2, lon2, radii)
-
-            # Stash everything needed to render results in session_state.
-            # This is required because st_folium is an interactive component:
-            # loading/clicking it triggers a Streamlit rerun, and on that rerun
-            # `st.button(...)` resets to False. Without session_state, the
-            # results computed above would vanish immediately after the map
-            # renders once. Storing them here lets the render step below run
-            # on every rerun, not just the one where the button was clicked.
-            st.session_state["compare_result"] = {
-                "lat1": lat1, "lon1": lon1, "lat2": lat2, "lon2": lon2,
-                "layer": layer, "radii": radii,
-                "img1": img1, "img2": img2,
-                "pct1": pct1, "conf1": conf1, "counts1": counts1,
-                "pct2": pct2, "conf2": conf2, "counts2": counts2,
-            }
-        except GEEDataError as e:
-            st.error(f"Earth Engine data issue: {e}")
-            st.session_state.pop("compare_result", None)
-        except ModelNotFoundError as e:
-            st.error(f"Model issue: {e}")
-            st.session_state.pop("compare_result", None)
-        except Exception as e:
-            st.error(f"Unexpected error during analysis: {e}")
-            st.session_state.pop("compare_result", None)
-
-    # Render from session_state (not just right after the button click) so
-    # results persist across the rerun that st_folium triggers.
-    result = st.session_state.get("compare_result")
-    if result:
-        lat1, lon1 = result["lat1"], result["lon1"]
-        lat2, lon2 = result["lat2"], result["lon2"]
-        layer, radii = result["layer"], result["radii"]
-        img1, img2 = result["img1"], result["img2"]
-        pct1, conf1, counts1 = result["pct1"], result["conf1"], result["counts1"]
-        pct2, conf2, counts2 = result["pct2"], result["conf2"], result["counts2"]
-
-        st.write("---")
-        st.subheader("🗺️ Map View")
-        map_col1, map_col2 = st.columns(2)
-        with map_col1:
-            mapA = get_map(lat1, lon1, img1, "Location A", layer, radii)
-            st_folium(mapA, width=500, height=400, key="mapA", returned_objects=[])
-        with map_col2:
-            mapB = get_map(lat2, lon2, img2, "Location B", layer, radii)
-            st_folium(mapB, width=500, height=400, key="mapB", returned_objects=[])
-
-        st.write("---")
-        st.subheader("📈 LULC Gradient (Center ➔ Outskirts, true annuli)")
-        gc1, gc2 = st.columns(2)
-        with gc1:
-            df1, _ = render_ring_results(pct1, conf1, counts1, "Location A")
-        with gc2:
-            df2, _ = render_ring_results(pct2, conf2, counts2, "Location B")
-
-        st.subheader("⚠️ Spatial Change Analysis (Innermost vs. Outermost Ring)")
-        inner_k, outer_k = df1.index[0], df1.index[-1]
-        change1 = df1.loc[outer_k] - df1.loc[inner_k]
-        change2 = df2.loc[outer_k] - df2.loc[inner_k]
-        change_df = pd.DataFrame({"Loc A Change": change1, "Loc B Change": change2})
-        st.dataframe(change_df.style.format("{:+.1f}%"))
-
-        st.subheader("📥 Export")
-        export_df = pd.concat([df1.assign(Location="A"), df2.assign(Location="B")])
-        exp1, exp2, exp3 = st.columns(3)
-        with exp1:
-            st.download_button("Download Analysis (CSV)", export_df.to_csv(),
-                                "geocompare_rings.csv", "text/csv")
-        with exp2:
-            st.download_button("Download Map A (HTML)", mapA.get_root().render(),
-                                "location_a_map.html", "text/html")
-        with exp3:
-            st.download_button("Download Map B (HTML)", mapB.get_root().render(),
-                                "location_b_map.html", "text/html")
-
-# ----------------------------------------------------------------------------
-# TAB 2: Batch / Time-Series
-# ----------------------------------------------------------------------------
-with tab_batch:
-    st.write(
-        "Upload a CSV with columns **name, lat, lon** to run ring analysis on many "
-        "locations at once, or use the same location across multiple years below "
-        "to see LULC change over time."
+c1, c2 = st.columns(2)
+with c1:
+    max_radius = st.slider("Max Outer Radius (meters)", 1000, 15000, 6000, step=500)
+    radii = [max_radius // 3, (max_radius * 2) // 3, max_radius]
+    ring_bounds = get_ring_bounds(radii)
+    ring_labels = [f"{i}-{o}m" for i, o in ring_bounds]
+    st.info(f"Rings: {', '.join(ring_labels)}")
+with c2:
+    years = st.multiselect(
+        "Years to compare",
+        options=YEAR_OPTIONS,
+        default=[y for y in DEFAULT_YEARS if y in YEAR_OPTIONS],
+        help=f"Sentinel-5P NO2 data starts in {NO2_MIN_YEAR}, so earlier years aren't available.",
     )
+    years = sorted(years)
 
-    mode = st.radio("Mode", ["Batch (multiple locations)", "Time-Series (one location, multiple years)"])
+layer = st.selectbox(
+    "Map Overlay",
+    ["RGB", "NDVI (Vegetation)", "NDWI (Water)", "LULC Classification (2021 reference)"],
+    help="RGB/NDVI/NDWI reflect the actual selected year's imagery. The LULC "
+         "overlay is a static 2021 reference layer for visual context only.",
+)
 
-    b_radius = st.slider("Max Outer Radius (meters)", 1000, 15000, 6000, step=500, key="batch_radius")
-    b_radii = [b_radius // 3, (b_radius * 2) // 3, b_radius]
+with st.expander("Advanced: cloud filter"):
+    cloud_filter = st.slider("Max cloud cover % (Sentinel-2)", 0, 100, 10)
 
-    if mode == "Batch (multiple locations)":
-        start_date, end_date, cloud_filter = date_range_controls("batch")
-        csv_file = st.file_uploader("Upload locations CSV (columns: name, lat, lon)", type=["csv"])
+if len(years) < 2:
+    st.warning("Pick at least 2 years to see a meaningful change-over-time comparison.")
 
-        if csv_file is not None:
-            locs_df = pd.read_csv(csv_file)
-            required_cols = {"name", "lat", "lon"}
-            if not required_cols.issubset(set(locs_df.columns.str.lower())):
-                st.error(f"CSV must contain columns: {required_cols}")
-                st.stop()
-            locs_df.columns = [c.lower() for c in locs_df.columns]
-            st.dataframe(locs_df)
+run_clicked = st.button("Run Ring x Year Analysis", type="primary", disabled=len(years) < 1)
 
-            if st.button("Run Batch Analysis"):
-                locations = locs_df.to_dict("records")
-                results = {}
-                progress = st.progress(0.0, text="Starting batch analysis...")
-                errors = []
-                for i, loc in enumerate(locations):
-                    try:
-                        img = get_base_image(loc["lat"], loc["lon"], b_radius, start_date, end_date, cloud_filter)
-                        pct, conf, counts = analyze_rings(img, loc["lat"], loc["lon"], b_radii)
-                        results[loc["name"]] = pct
-                    except (GEEDataError, ModelNotFoundError) as e:
-                        errors.append(f"{loc['name']}: {e}")
-                    progress.progress((i + 1) / len(locations), text=f"Processed {loc['name']}")
+# ----------------------------------------------------------------------------
+# Run analysis
+# ----------------------------------------------------------------------------
+if run_clicked:
+    try:
+        with st.spinner(f"Analyzing {len(years)} year(s) x {len(radii)} rings - this can take a minute..."):
+            results = analyze_location_over_time(lat, lon, radii, years, cloud_filter)
 
-                if errors:
-                    st.warning("Some locations failed:\n" + "\n".join(errors))
+        # Results (and a couple of things needed to redraw the map) are
+        # stashed in session_state because st_folium triggers a Streamlit
+        # rerun on load/interaction, which would otherwise wipe out anything
+        # computed only inside this `if run_clicked:` block.
+        st.session_state["ts_result"] = {
+            "lat": lat, "lon": lon, "radii": radii, "years": years, "layer": layer,
+            "results": results,
+        }
+    except ModelNotFoundError as e:
+        st.error(f"Model issue: {e}")
+        st.session_state.pop("ts_result", None)
+    except Exception as e:
+        st.error(f"Unexpected error during analysis: {e}")
+        st.session_state.pop("ts_result", None)
 
-                if results:
-                    combined = pd.concat(
-                        {name: pd.DataFrame(r) for name, r in results.items()}, axis=0
-                    )
-                    combined.index.names = ["Location", "Ring"]
-                    st.write("### Batch Results")
-                    st.dataframe(combined.style.format("{:.1f}"))
-                    st.download_button("Download Batch Results (CSV)", combined.to_csv(),
-                                        "geocompare_batch.csv", "text/csv")
+# ----------------------------------------------------------------------------
+# Render (from session_state, so it survives st_folium's rerun)
+# ----------------------------------------------------------------------------
+state = st.session_state.get("ts_result")
+if state:
+    lat, lon, radii, years, layer = state["lat"], state["lon"], state["radii"], state["years"], state["layer"]
+    results = state["results"]
+    ring_bounds = get_ring_bounds(radii)
+    ring_labels = [f"{i}-{o}m" for i, o in ring_bounds]
 
-    else:  # Time-Series mode
-        st.write("Analyze how land use has changed at **one location** across multiple date ranges.")
-        c1, c2 = st.columns(2)
-        with c1:
-            ts_lat = st.number_input("Latitude", value=28.4089, min_value=-90.0, max_value=90.0, format="%.6f", key="ts_lat")
-        with c2:
-            ts_lon = st.number_input("Longitude", value=77.3178, min_value=-180.0, max_value=180.0, format="%.6f", key="ts_lon")
+    # Surface any partial errors (e.g. a cloudy year with no clean Sentinel-2
+    # scenes, or NO2 unavailable for an old year) without blocking everything else.
+    all_errors = []
+    for yr, yr_data in results.items():
+        for err in yr_data["errors"]:
+            all_errors.append(f"{yr}: {err}")
+    if all_errors:
+        with st.expander(f"Data issues encountered ({len(all_errors)}) - click to view"):
+            for err in all_errors:
+                st.write(f"- {err}")
 
-        years_input = st.text_input("Years to compare (comma-separated)", value="2019,2021,2023")
-        cloud_filter_ts = st.slider("Max cloud cover %", 0, 100, 10, key="ts_cloud")
-
-        if st.button("Run Time-Series Analysis"):
+    st.write("---")
+    st.subheader("Map View by Year")
+    st.caption(
+        "RGB/NDVI/NDWI show that year's actual satellite composite. The LULC "
+        "overlay (if selected) is a static 2021 reference - it won't change "
+        "across years; only the ring statistics below do."
+    )
+    map_cols = st.columns(len(years))
+    for idx, yr in enumerate(years):
+        with map_cols[idx]:
+            st.write(f"**{yr}**")
             try:
-                years = [y.strip() for y in years_input.split(",") if y.strip()]
-                yearly_results = {}
-                progress = st.progress(0.0, text="Starting time-series analysis...")
-                for i, yr in enumerate(years):
-                    start_date = f"{yr}-01-01"
-                    end_date = f"{yr}-12-31"
-                    img = get_base_image(ts_lat, ts_lon, b_radius, start_date, end_date, cloud_filter_ts)
-                    pct, conf, counts = analyze_rings(img, ts_lat, ts_lon, b_radii)
-                    # collapse rings into one overall composition per year (area-weighted would need
-                    # per-ring area; here we show outermost ring as the "whole area" summary)
-                    outer_key = list(pct.keys())[-1]
-                    yearly_results[yr] = pct[outer_key]
-                    progress.progress((i + 1) / len(years), text=f"Processed {yr}")
-
-                ts_df = pd.DataFrame(yearly_results).T
-                ts_df.index.name = "Year"
-                st.write("### LULC Change Over Time (outer ring composition)")
-                st.line_chart(ts_df)
-                st.dataframe(ts_df.style.format("{:.1f}"))
-                st.download_button("Download Time-Series (CSV)", ts_df.to_csv(),
-                                    "geocompare_timeseries.csv", "text/csv")
+                img = get_base_image_for_year(lat, lon, max(radii), yr, 10)
+                m = get_map(lat, lon, img, f"Location ({yr})", layer, radii, year=yr)
+                st_folium(m, width=None, height=300, key=f"map_{yr}", returned_objects=[])
             except GEEDataError as e:
-                st.error(f"Earth Engine data issue: {e}")
-            except ModelNotFoundError as e:
-                st.error(f"Model issue: {e}")
+                st.warning(f"No imagery available for {yr}: {e}")
+
+    # ------------------------------------------------------------------------
+    # Build tidy DataFrames for charting: one row per (year, ring), columns
+    # for each LULC class % and NO2.
+    # ------------------------------------------------------------------------
+    rows = []
+    for yr in years:
+        yr_data = results[yr]
+        for label in ring_labels:
+            row = {"Year": yr, "Ring": label}
+            row.update(yr_data["lulc_pct"].get(label, {}))
+            row["NO2 (umol/m2)"] = yr_data["no2"].get(label)
+            rows.append(row)
+    long_df = pd.DataFrame(rows)
+
+    st.write("---")
+    st.subheader("LULC Change Over Time, Per Ring")
+    lulc_cols = st.columns(len(ring_labels))
+    for idx, label in enumerate(ring_labels):
+        with lulc_cols[idx]:
+            st.write(f"**Ring {label}**")
+            ring_df = long_df[long_df["Ring"] == label].set_index("Year")[list(CLASS_NAMES.values())]
+            st.line_chart(ring_df)
+
+    st.write("---")
+    st.subheader("NO2 (Air Quality) Change Over Time, Per Ring")
+    st.caption(
+        "Mean tropospheric NO2 column density (umol/m2) from Sentinel-5P - "
+        "higher values generally indicate more traffic/industrial activity. "
+        "This is a raw satellite measurement, not a model prediction."
+    )
+    no2_wide = long_df.pivot(index="Year", columns="Ring", values="NO2 (umol/m2)")
+    st.line_chart(no2_wide)
+
+    with st.expander("Show full data table (LULC % + NO2, all years and rings)"):
+        st.dataframe(long_df.set_index(["Year", "Ring"]).style.format("{:.2f}"))
+
+    # ------------------------------------------------------------------------
+    # Headline comparison: earliest vs. latest selected year
+    # ------------------------------------------------------------------------
+    if len(years) >= 2:
+        st.write("---")
+        st.subheader(f"Overall Change: {years[0]} to {years[-1]}")
+        change_rows = []
+        for label in ring_labels:
+            first = long_df[(long_df["Year"] == years[0]) & (long_df["Ring"] == label)].iloc[0]
+            last = long_df[(long_df["Year"] == years[-1]) & (long_df["Ring"] == label)].iloc[0]
+            row = {"Ring": label}
+            for cls in CLASS_NAMES.values():
+                if pd.notna(first.get(cls)) and pd.notna(last.get(cls)):
+                    row[f"{cls} Delta%"] = last[cls] - first[cls]
+                else:
+                    row[f"{cls} Delta%"] = None
+            if pd.notna(first.get("NO2 (umol/m2)")) and pd.notna(last.get("NO2 (umol/m2)")):
+                row["NO2 Delta (umol/m2)"] = last["NO2 (umol/m2)"] - first["NO2 (umol/m2)"]
+            else:
+                row["NO2 Delta (umol/m2)"] = None
+            change_rows.append(row)
+        change_df = pd.DataFrame(change_rows).set_index("Ring")
+        st.dataframe(change_df.style.format("{:+.2f}"))
+
+        st.caption(
+            "A ring where Built-up Delta% is strongly positive and NO2 Delta "
+            "is also positive suggests urbanization tracking with worsening "
+            "air quality in that zone - the core hypothesis this tool is "
+            "built to explore. This is a descriptive correlation, not a "
+            "statistically tested causal claim."
+        )
+
+    st.write("---")
+    st.subheader("Export")
+    st.download_button(
+        "Download Full Analysis (CSV)",
+        long_df.to_csv(index=False),
+        "geocompare_timeseries.csv",
+        "text/csv",
+    )

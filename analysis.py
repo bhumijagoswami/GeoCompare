@@ -16,8 +16,11 @@ import os
 import joblib
 import pandas as pd
 import numpy as np
-import ee
 import streamlit as st
+
+from gee_utils import (
+    ring_geometry, get_base_image_for_year, get_no2_for_ring, GEEDataError
+)
 
 MODEL_PATH = "model.pkl"
 FEATURE_COLS = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12', 'NDVI', 'NDWI', 'NDBI', 'BSI', 'TEXTURE']
@@ -36,19 +39,21 @@ class NoSamplesError(Exception):
 def load_model():
     if not os.path.exists(MODEL_PATH):
         raise ModelNotFoundError(
-            f"'{MODEL_PATH}' not found. Train it with train_model.py and commit it "
+            f"'{MODEL_PATH}' not found. Train it with train_model_colab.py and commit it "
             f"to the repo root (or update MODEL_PATH)."
         )
     return joblib.load(MODEL_PATH)
 
 
-def _ring_geometry(lat, lon, r_inner, r_outer):
-    """True annulus: outer buffer minus inner buffer. r_inner=0 -> solid disk."""
-    outer = ee.Geometry.Point([lon, lat]).buffer(r_outer)
-    if r_inner <= 0:
-        return outer
-    inner = ee.Geometry.Point([lon, lat]).buffer(r_inner)
-    return outer.difference(inner, ee.ErrorMargin(1))
+def get_ring_bounds(radii):
+    """Turns [2000, 4000, 6000] into [(0,2000), (2000,4000), (4000,6000)]."""
+    sorted_radii = sorted(radii)
+    bounds = []
+    prev_r = 0
+    for r in sorted_radii:
+        bounds.append((prev_r, r))
+        prev_r = r
+    return bounds
 
 
 def _classify_ring(gee_image, geometry, num_pixels=800, scale=30):
@@ -94,50 +99,87 @@ def _classify_ring(gee_image, geometry, num_pixels=800, scale=30):
 @st.cache_data(show_spinner=False, ttl=3600)
 def analyze_rings(_gee_image, lat, lon, radii, num_pixels=800, scale=30):
     """
-    Runs true-annulus ring classification.
-    Returns (pct_df_dict, confidence_df_dict, sample_counts_dict).
+    Runs true-annulus ring classification for ONE image (one point in time).
+    Returns (pct_results, conf_results, counts), each a dict keyed by ring
+    label like "0-2000m" -> {class_name: value}.
     Leading underscore on _gee_image tells st.cache_data not to try hashing
     the ee.Image object; lat/lon/radii still form the cache key.
     """
-    sorted_radii = sorted(radii)
     pct_results = {}
     conf_results = {}
     counts = {}
-    prev_r = 0
-    for r in sorted_radii:
-        geom = _ring_geometry(lat, lon, prev_r, r)
-        label = f"{prev_r}-{r}m"
+    for r_inner, r_outer in get_ring_bounds(radii):
+        geom = ring_geometry(lat, lon, r_inner, r_outer)
+        label = f"{r_inner}-{r_outer}m"
         try:
             pct_stats, conf_stats, total = _classify_ring(_gee_image, geom, num_pixels, scale)
-        except NoSamplesError as e:
+        except NoSamplesError:
             pct_stats = {name: 0.0 for name in CLASS_NAMES.values()}
             conf_stats = {name: None for name in CLASS_NAMES.values()}
             total = 0
         pct_results[label] = pct_stats
         conf_results[label] = conf_stats
         counts[label] = total
-        prev_r = r
 
     return pct_results, conf_results, counts
 
 
-def analyze_locations(locations, radii, num_pixels=800, scale=30, get_base_image_fn=None,
-                       max_radius=None, start_date=None, end_date=None):
+@st.cache_data(show_spinner=False, ttl=3600)
+def analyze_location_over_time(lat, lon, radii, years, cloud_filter=10, num_pixels=800, scale=30):
     """
-    Batch entry point for multi-location support.
-    locations: list of dicts like {"name": "A", "lat": .., "lon": ..}
-    Returns: dict keyed by location name -> (pct_results, conf_results, counts)
-    Requires get_base_image_fn (e.g. gee_utils.get_base_image) to fetch imagery
-    per location before ring analysis.
-    """
-    if get_base_image_fn is None:
-        raise ValueError("get_base_image_fn is required for batch analysis")
+    The core of the redesigned single-location, multi-year workflow.
 
-    out = {}
-    for loc in locations:
-        img = get_base_image_fn(
-            loc["lat"], loc["lon"], max_radius,
-            start_date=start_date, end_date=end_date
-        )
-        out[loc["name"]] = analyze_rings(img, loc["lat"], loc["lon"], radii, num_pixels, scale)
-    return out
+    For each year, fetches a Sentinel-2 annual composite, classifies LULC
+    per ring, and fetches the mean NO2 concentration per ring from
+    Sentinel-5P. Returns a nested dict:
+
+        {
+          year: {
+            "lulc_pct": {ring_label: {class_name: pct}},
+            "lulc_conf": {ring_label: {class_name: confidence}},
+            "lulc_counts": {ring_label: sample_count},
+            "no2": {ring_label: micromoles_per_m2 or None},
+            "errors": [list of any per-ring/per-year issues, for display]
+          },
+          ...
+        }
+
+    Partial failures (e.g. NO2 unavailable for an old year, or a cloud-heavy
+    year with no clean Sentinel-2 scenes) are recorded per-year in "errors"
+    rather than crashing the whole multi-year analysis.
+    """
+    results = {}
+    ring_bounds = get_ring_bounds(radii)
+
+    for year in years:
+        year_errors = []
+
+        # --- LULC side (needs the trained classifier) ---
+        try:
+            img = get_base_image_for_year(lat, lon, max(radii), year, cloud_filter)
+            lulc_pct, lulc_conf, lulc_counts = analyze_rings(img, lat, lon, radii, num_pixels, scale)
+        except GEEDataError as e:
+            year_errors.append(f"LULC: {e}")
+            lulc_pct = {f"{i}-{o}m": {name: None for name in CLASS_NAMES.values()} for i, o in ring_bounds}
+            lulc_conf = {f"{i}-{o}m": {name: None for name in CLASS_NAMES.values()} for i, o in ring_bounds}
+            lulc_counts = {f"{i}-{o}m": 0 for i, o in ring_bounds}
+
+        # --- NO2 side (raw measurement, no ML model involved) ---
+        no2_by_ring = {}
+        for r_inner, r_outer in ring_bounds:
+            label = f"{r_inner}-{r_outer}m"
+            try:
+                no2_by_ring[label] = get_no2_for_ring(lat, lon, r_inner, r_outer, year)
+            except GEEDataError as e:
+                no2_by_ring[label] = None
+                year_errors.append(f"NO2 ({label}): {e}")
+
+        results[year] = {
+            "lulc_pct": lulc_pct,
+            "lulc_conf": lulc_conf,
+            "lulc_counts": lulc_counts,
+            "no2": no2_by_ring,
+            "errors": year_errors,
+        }
+
+    return results

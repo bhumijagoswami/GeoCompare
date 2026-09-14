@@ -39,7 +39,7 @@ def _add_ee_layer(m: folium.Map, ee_image_object, vis_params, name):
 
 
 def _add_legend(m: folium.Map, layer_type: str):
-    if layer_type != "LULC Classification":
+    if layer_type != "LULC Classification (2021 reference)":
         return
     items = "".join(
         f'<div style="display:flex;align-items:center;margin-bottom:2px;color:#1a1a1a;">'
@@ -58,25 +58,34 @@ def _add_legend(m: folium.Map, layer_type: str):
     m.get_root().html.add_child(folium.Element(legend_html))
 
 
-def get_map(lat, lon, img, popup_name, layer_type, radii):
+def get_map(lat, lon, img, popup_name, layer_type, radii, year=None):
+    title_suffix = f" ({year})" if year else ""
     m = folium.Map(location=[lat, lon], zoom_start=12)
     max_r = max(radii)
     poi = ee.Geometry.Point([lon, lat]).buffer(max_r)
 
     if layer_type == "RGB":
         vis = {'bands': ['B4', 'B3', 'B2'], 'min': 0, 'max': 3000, 'gamma': 1.4}
-        _add_ee_layer(m, img, vis, layer_type)
+        _add_ee_layer(m, img, vis, f"RGB{title_suffix}")
     elif layer_type == "NDVI (Vegetation)":
         vis = {'bands': ['NDVI'], 'min': 0, 'max': 1, 'palette': ['white', 'green']}
-        _add_ee_layer(m, img, vis, layer_type)
+        _add_ee_layer(m, img, vis, f"NDVI{title_suffix}")
     elif layer_type == "NDWI (Water)":
         vis = {'bands': ['NDWI'], 'min': 0, 'max': 1, 'palette': ['white', 'blue']}
-        _add_ee_layer(m, img, vis, layer_type)
-    elif layer_type == "LULC Classification":
+        _add_ee_layer(m, img, vis, f"NDWI{title_suffix}")
+    elif layer_type == "LULC Classification (2021 reference)":
+        # NOTE: this is a STATIC reference layer from ESA WorldCover 2021 —
+        # it will look identical for every year you select. It's shown for
+        # visual/geographic context only. The actual year-by-year LULC
+        # percentages come from our own trained model applied to each year's
+        # Sentinel-2 composite (see the ring stats/charts below the map),
+        # not from this overlay. We can't render our own model's pixel-by-
+        # pixel predictions as a live map tile the way Earth Engine's native
+        # classifiers can — ours runs in Python on sampled points instead.
         worldcover = ee.Image('ESA/WorldCover/v200/2021').select('Map').clip(poi)
         remapped = worldcover.remap([10, 40, 50, 80, 60], [0, 0, 1, 2, 3], defaultValue=255)
         vis = {'min': 0, 'max': 3, 'palette': list(LULC_LEGEND.values())}
-        _add_ee_layer(m, remapped, vis, layer_type)
+        _add_ee_layer(m, remapped, vis, "LULC Classification (2021 reference, static)")
 
     folium.Marker([lat, lon], popup=popup_name, tooltip=popup_name).add_to(m)
 
