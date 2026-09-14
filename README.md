@@ -1,119 +1,135 @@
+```markdown
 # 🌍 GeoCompare
 
-**v3: Single-location concentric ring analysis, across multiple years, combining land-cover change (LULC) with air quality (NO2).**
+**v3: Single-location concentric ring analysis, across multiple years, combining land-cover change (LULC) with air quality (NO2).**[cite: 5]
 
-GeoCompare shows how one location has changed over time — not just spatially
-(center → outskirts, via concentric rings) but temporally (year over year),
-and now correlates that change with **air quality trends**.
+GeoCompare shows how one location has changed over time — not just spatially (center → outskirts, via concentric rings) but temporally (year over year), and now correlates that change with **air quality trends**.[cite: 5]
 
 ## How it works
 
-1. Pick one location (lat/lon) and a max radius → it's split into **3 true
-   concentric annulus rings** (not solid nested circles — each ring's stats
-   reflect only that zone).
-2. Pick 2+ years (2019 onward, since that's when Sentinel-5P NO2 data starts).
+1. Pick one location (lat/lon) and a max radius → it is split into **3 true concentric annulus rings** (not solid nested circles — each ring's stats reflect only that zone)[cite: 5].
+2. Pick 2+ years (2019 onward, since that's when Sentinel-5P NO2 data starts)[cite: 5].
 3. For each ring, for each year, it computes:
-   - **LULC composition** (Vegetation / Built-up / Water / Bare Land %) via
-     a Random Forest classifier trained on Sentinel-2 imagery + ESA WorldCover
-     labels (see `train_model_colab.py`).
-   - **Mean NO2 concentration** (µmol/m²) via Sentinel-5P TROPOMI — a raw
-     satellite measurement, no ML model involved.
-4. Renders per-year maps, per-ring LULC trend charts, an NO2 trend chart, and
-   a headline "change from first year to last year" table per ring — the
-   basis for spotting patterns like "this ring's Built-up % rose sharply,
-   and its NO2 rose alongside it."
+   - **LULC composition** (Vegetation / Built-up / Water / Bare Land %) via an XGBoost classifier trained on Sentinel-2 optical bands, Sentinel-1 SAR (VV/VH), VIIRS nighttime lights, and ESA WorldCover labels (see `train_model_colab.py`)[cite: 5, 9].
+   - **Mean NO2 concentration** (µmol/m²) via Sentinel-5P TROPOMI — a raw satellite measurement, no ML model involved[cite: 5].
+4. Renders per-year maps, per-ring LULC trend charts, an NO2 trend chart, and a headline "change from first year to last year" table per ring — the basis for spotting patterns like "this ring's Built-up % rose sharply, and its NO2 rose alongside it."[cite: 5]
 
 ## Data sources & real limitations (know these before demoing)
 
-- **Sentinel-2** (LULC features): available from mid-2015 onward.
-- **Sentinel-5P TROPOMI** (NO2): available from **2018 onward only** —
-  this is why the app doesn't allow years before 2019 (2018 itself is a
-  partial year of coverage). There is **no way to get satellite-based NO2
-  for, say, 2011** — that data simply doesn't exist.
-- **ESA WorldCover** (used for the map's visual LULC reference layer) only
-  has **2020 and 2021** editions. It is a *static* reference layer on the
-  map — it will look the same regardless of which year you select. The
-  actual year-by-year LULC percentages come from our own trained model
-  applied to each year's Sentinel-2 composite, not from this overlay.
-- The model was trained on **8 regions across India** — treat its accuracy
-  as most trustworthy within similar Indian landscapes, not validated
-  globally.
+- **Sentinel-2, Sentinel-1 SAR, & VIIRS** (LULC features): available across multi-year comparisons to construct a 15-band feature stack[cite: 5, 9].
+- **Sentinel-5P TROPOMI** (NO2): available from **2018 onward only** — this is why the app does not allow years before 2019 (2018 itself is a partial year of coverage)[cite: 5]. There is **no way to get satellite-based NO2 for earlier years (e.g., 2011)** — that data simply does not exist[cite: 5].
+- **ESA WorldCover** (used for the map's visual LULC reference layer) only has **2020 and 2021** editions[cite: 5]. It is a *static* reference layer on the map — it will look the same regardless of which year you select[cite: 5]. The actual year-by-year LULC percentages come from our own trained model applied to each year's satellite composite, not from this overlay[cite: 5].
+- The model was trained across **16 diverse eco-regions in India** (arid, urban, coastal, delta, and foothill zones) — treat its accuracy as most trustworthy within similar Indian landscapes, not globally validated[cite: 5, 9].
 
 ## Project structure
 
+
 ```
+
 geocompare/
 ├── app.py                  # Streamlit UI — single location, multi-year
-├── gee_utils.py             # Earth Engine auth, Sentinel-2 + Sentinel-5P (NO2) fetching, ring geometry
-├── analysis.py              # RF classification, true-annulus rings, year-loop analysis
+├── gee_utils.py             # Earth Engine auth, feature composite extraction, ring geometry
+├── analysis.py              # XGBoost classification, true-annulus rings, year-loop analysis
 ├── map_utils.py              # Folium map rendering, legend, ring overlays
-├── train_model_colab.py      # Colab script: retrain the RF model with traceable WorldCover labels
-├── model.pkl                 # Trained RandomForestClassifier (binary)
+├── train_model_colab.py      # Colab script: stratified sampling & XGBoost training pipeline
+├── model.pkl                 # Trained XGBClassifier (binary)
 ├── model_metadata.json       # Training provenance, accuracy, confusion matrix
 ├── requirements.txt
 ├── .gitignore
 └── README.md
-```
 
-## Model performance (update this after retraining)
+```[cite: 5]
 
-Current model: **76.88% accuracy** (11 features: 6 spectral bands + NDVI/NDWI/NDBI + BSI + local texture).
-Per-class recall: Vegetation 84.6%, Built-up 65%, Water 91.7%, Bare Land 66.25%.
-Built-up and Bare Land remain the hardest to distinguish — a known,
-explainable limitation of spectral-only classification (see `model_metadata.json`
-for the full confusion matrix and notes on what was tried to improve this).
+## Model performance
+
+Current model: **83.27% accuracy** (15 features: 6 spectral bands + NDVI/NDWI/NDBI + BSI + local texture + seasonal NDVI std + SAR VV/VH + VIIRS nighttime lights)[cite: 9].
+
+* **Validation Accuracy:** 83.27%[cite: 9]
+* **Cross-Validation Accuracy:** 83.55%[cite: 9]
+* **Per-class recall:** Water 94.1%, Vegetation 87.2%, Built-up 75.3%, Bare Land 74.7%[cite: 9].
+
+**Progression:**
+* **v1 (RF, 8 features, 8 regions):** 73.85% accuracy[cite: 9].
+* **v2 (RF, +B12/BSI/TEXTURE, 8 regions):** 76.88% accuracy[cite: 9].
+* **v3 (RF, 16 regions, GridSearch):** 77.92% — doubling data revealed an algorithm ceiling[cite: 9].
+* **v4 (XGBoost baseline, 11 features):** 78.54% — slight improvement, but Built-up and Bare Land remained heavily confused[cite: 7, 9].
+* **v5 (Current — XGBoost + SAR + VIIRS + Seasonal NDVI, 16 regions):** 83.27% — SAR double-bounce radar scattering and nighttime radiance successfully separated concrete from dry soil[cite: 9].
+
+See `model_metadata.json` for the full confusion matrix, hyperparameter specs, and split distributions[cite: 5, 9].
 
 ## Setup
 
-1. Clone the repo and install dependencies:
+1. Clone the repo and install dependencies[cite: 5]:
    ```bash
    pip install -r requirements.txt
-   ```
+
+```
+
 2. Set up Earth Engine auth. For local dev, run `earthengine authenticate` once.
-   For Streamlit Cloud, add a service account under **Settings → Secrets**:
-   ```toml
-   [gcp_service_account]
-   type = "service_account"
-   project_id = "your-project-id"
-   private_key_id = "..."
-   private_key = "..."
-   client_email = "..."
-   client_id = "..."
-   ```
-   The service account needs these IAM roles on your Google Cloud project:
-   **Service Usage Consumer**, **Earth Engine Resource Viewer**, and
-   **Earth Engine Resource Writer** (the last one is required for map tile
-   generation via `getMapId`, not just data reads).
-3. Make sure `model.pkl` is present in the repo root, and `model_metadata.json`
-   reflects its actual training run.
+For Streamlit Cloud, add a service account under **Settings → Secrets**:
+
+
+```toml
+[gcp_service_account]
+type = "service_account"
+project_id = "your-project-id"
+private_key_id = "..."
+private_key = "..."
+client_email = "..."
+client_id = "..."
+
+```
+
+
+The service account needs these IAM roles on your Google Cloud project:
+
+
+* **Service Usage Consumer**
+
+* **Earth Engine Resource Viewer**
+
+* **Earth Engine Resource Writer** (required for map tile generation via `getMapId`, not just data reads).
+
+
+
+
+3. Ensure `model.pkl` is present in the repo root and `model_metadata.json` reflects the current training run.
+
+
 4. Run locally:
-   ```bash
-   streamlit run app.py
-   ```
+
+
+```bash
+streamlit run app.py
+
+```
+
+
 
 ## Known limitations / roadmap
 
-- **NO2 and LULC use different underlying resolutions** (Sentinel-5P ~1km vs
-  Sentinel-2 ~10-30m) — the ring-level averaging smooths over this, but it's
-  worth knowing the two signals aren't pixel-for-pixel comparable.
-- **Correlation shown is descriptive, not causal** — a ring showing both
-  rising Built-up % and rising NO2 suggests a relationship worth
-  investigating, not a proven cause-and-effect claim.
-- **The LULC map overlay is a static reference layer**, not a rendered
-  version of our own model's per-year predictions — see the note under
-  Data Sources above for why.
-- **Model accuracy ceiling**: further gains beyond ~77% likely need more
-  training data, multi-temporal features, or a different model architecture
-  (see `model_metadata.json` notes and chat history for a fuller list of
-  options considered).
+* **Sensor Resolution Discrepancy**: Sentinel-5P NO2 (~1.1 km resolution) and Sentinel-2/Sentinel-1 (~10–30 m resolution) operate at fundamentally different spatial scales. Ring-level aggregation smooths this, but pixels are not 1:1 comparable.
+
+
+* **Descriptive Correlation**: Trends showing simultaneous increases in Built-up % and NO2 represent observed spatial-temporal correlations, not a mathematically proven causal model.
+
+
+* **Static Map Overlay**: Live inference tiles cannot be streamed pixel-by-pixel into Folium without server-side Earth Engine asset ingestion; Folium displays the static ESA WorldCover 2021 layer for visual reference while the graphs display the actual live model predictions.
+
+
 
 ## Contributing / editing on GitHub
 
-- Never commit `.streamlit/secrets.toml` or any real service-account JSON.
-- If you retrain `model.pkl`, update `model_metadata.json` and this README's
-  "Model performance" section in the same PR — keep them in sync.
-- If you change `FEATURE_COLS` in `analysis.py`, you MUST also update
-  `train_model_colab.py`'s feature list and `gee_utils.py`'s feature-image
-  builder to match, or predictions will break or error out with a
-  feature-mismatch.
+* Never commit `.streamlit/secrets.toml` or any private service-account key files.
 
+
+* If you retrain `model.pkl`, update `model_metadata.json` and this README's "Model performance" section in the same commit.
+
+
+* If you change `FEATURE_COLS` in `analysis.py`, you **must** update `train_model_colab.py` and `gee_utils.py` to match identically, or prediction pipelines will fail with a dimension mismatch.
+
+
+
+```
+
+```
